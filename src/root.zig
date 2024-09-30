@@ -6,6 +6,7 @@ const testing = std.testing;
 const QOIError = error{
     UnexpectedEOF,
     InvalidData,
+    OutOfMemory,
 };
 
 const QOIChannels = enum(u8) {
@@ -25,7 +26,7 @@ const QOIHeader = struct {
     colorspace: QOIColorspace,
 };
 
-fn readQOIHeader(reader: AnyReader) QOIError!QOIHeader {
+fn readQOIHeader(reader: *AnyReader) QOIError!QOIHeader {
     const magic = try (reader.readBytesNoEof(4) catch QOIError.UnexpectedEOF);
     if (!(std.meta.eql(magic, [_]u8{ 'q', 'o', 'i', 'f' }))) {
         return QOIError.InvalidData;
@@ -69,14 +70,16 @@ const QOIChunk = union(enum) {
     },
     index: u6,
     diff: struct {
-        dr_minus2: u2,
-        dg_minus2: u2,
-        db_minus2: u2,
+        // @TODO: Could these just be i2s?
+        dr_plus2: u2,
+        dg_plus2: u2,
+        db_plus2: u2,
     },
     luma: struct {
-        dg_minus32: u6,
-        dr_minus8: u4,
-        db_minus8: u4,
+        // @TODO: Same as .diff
+        dg_plus32: u6,
+        dr_plus8: u4,
+        db_plus8: u4,
     },
     run: u6,
 };
@@ -148,6 +151,121 @@ fn readQOIChunk(reader: *AnyReader) QOIError!QOIChunk {
     unreachable;
 }
 
+const QOIPixel = packed struct {
+    red: u8,
+    green: u8,
+    blue: u8,
+    alpha: u8,
+
+    fn hash(self: *const QOIPixel) u8 {
+        const r: u16 = self.red;
+        const g: u16 = self.green;
+        const b: u16 = self.blue;
+        const a: u16 = self.alpha;
+        return @truncate((r * 3 + g * 5 + b * 7 + a * 11) % 64);
+    }
+};
+
+pub fn readQOI(reader: *AnyReader, allocator: std.mem.Allocator) QOIError![]QOIPixel {
+    var array = [_]QOIPixel{QOIPixel{
+        .red = 0,
+        .green = 0,
+        .blue = 0,
+        .alpha = 0,
+    }} ** 64;
+    var prev = QOIPixel{
+        .red = 0,
+        .green = 0,
+        .blue = 0,
+        .alpha = 255,
+    };
+
+    const header = try readQOIHeader(reader);
+    const pixcnt = header.width * header.height;
+    var data = try (allocator.alloc(QOIPixel, pixcnt) catch QOIError.OutOfMemory);
+
+    var i: usize = 0;
+    // @TODO: Alternatively detect the end code:
+    //        0x0000000000000001
+    while (i < pixcnt) {
+        const chunk = try readQOIChunk(reader);
+        // @TODO: This should be broken into multiple functions, probably
+        //        manipulating a context struct.
+        switch (chunk) {
+            .rgb => |payload| {
+                const pixel = QOIPixel{
+                    .red = payload.red,
+                    .green = payload.green,
+                    .blue = payload.blue,
+                    .alpha = prev.alpha,
+                };
+                array[pixel.hash()] = pixel;
+                data[i] = pixel;
+                i += 1;
+                prev = pixel;
+            },
+            .rgba => |payload| {
+                const pixel = QOIPixel{
+                    .red = payload.red,
+                    .green = payload.green,
+                    .blue = payload.blue,
+                    .alpha = payload.alpha,
+                };
+                array[pixel.hash()] = pixel;
+                data[i] = pixel;
+                i += 1;
+                prev = pixel;
+            },
+            .index => |index| {
+                const pixel = array[index];
+                data[i] = pixel;
+                i += 1;
+                prev = pixel;
+            },
+            .diff => |payload| {
+                const dr = @as(i8, payload.dr_plus2) - 2;
+                const dg = @as(i8, payload.dg_plus2) - 2;
+                const db = @as(i8, payload.db_plus2) - 2;
+                const pixel = QOIPixel{
+                    .red = prev.red +% @as(u8, @bitCast(dr)),
+                    .green = prev.green +% @as(u8, @bitCast(dg)),
+                    .blue = prev.blue +% @as(u8, @bitCast(db)),
+                    .alpha = prev.alpha,
+                };
+                array[pixel.hash()] = pixel;
+                data[i] = pixel;
+                i += 1;
+                prev = pixel;
+            },
+            .luma => |payload| {
+                const dr_dg = @as(i8, payload.dr_plus8) - 8;
+                const dg = @as(i8, payload.dg_plus32) - 32;
+                const db_dg = @as(i8, payload.db_plus8) - 8;
+                const dr = dr_dg + dg;
+                const db = db_dg + dg;
+                const pixel = QOIPixel{
+                    .red = prev.red +% @as(u8, @bitCast(dr)),
+                    .green = prev.green +% @as(u8, @bitCast(dg)),
+                    .blue = prev.blue +% @as(u8, @bitCast(db)),
+                    .alpha = prev.alpha,
+                };
+                array[pixel.hash()] = pixel;
+                data[i] = pixel;
+                i += 1;
+                prev = pixel;
+            },
+            .run => |run| {
+                for (0..run + 1) |_| {
+                    data[i] = prev;
+                    i += 1;
+                }
+            },
+        }
+    }
+
+    return data;
+}
+
 test "header" {
     const fixedBufferStream = std.io.fixedBufferStream;
 
@@ -157,8 +275,8 @@ test "header" {
                            0x03,
                            0x00 };
     var buffer_stream1 = fixedBufferStream(buffer1[0..]);
-    const reader1 = buffer_stream1.reader();
-    const header1 = try readQOIHeader(reader1.any());
+    var reader1 = buffer_stream1.reader().any();
+    const header1 = try readQOIHeader(&reader1);
     try testing.expect(header1.width == 66051);
     try testing.expect(header1.height == 269554195);
     try testing.expect(header1.channels == QOIChannels.rgb);
@@ -207,9 +325,9 @@ test "chunk" {
     const chunk4 = try readQOIChunk(&reader4);
     try testing.expect(std.meta.eql(chunk4, QOIChunk{
         .diff = .{
-            .dr_minus2 = 0b00,
-            .dg_minus2 = 0b11,
-            .db_minus2 = 0b01,
+            .dr_plus2 = 0b00,
+            .dg_plus2 = 0b11,
+            .db_plus2 = 0b01,
         }
     }));
 
@@ -219,9 +337,9 @@ test "chunk" {
     const chunk5 = try readQOIChunk(&reader5);
     try testing.expect(std.meta.eql(chunk5, QOIChunk{
         .luma = .{
-            .dg_minus32 = 0b101101,
-            .dr_minus8 = 0b1010,
-            .db_minus8 = 0b1110,
+            .dg_plus32 = 0b101101,
+            .dr_plus8 = 0b1010,
+            .db_plus8 = 0b1110,
         }
     }));
 
