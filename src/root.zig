@@ -259,6 +259,8 @@ pub fn readQOI(reader: *AnyReader, allocator: std.mem.Allocator) QOIError![]QOIP
                     data[i] = prev;
                     i += 1;
                 }
+                // https://github.com/phoboslab/qoi/issues/258
+                array[prev.hash()] = prev;
             },
         }
     }
