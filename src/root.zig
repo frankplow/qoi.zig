@@ -351,3 +351,38 @@ test "chunk" {
         .run = 0b010110,
     }));
 }
+
+test "end-to-end" {
+    const dir = std.fs.cwd();
+    const allocator = std.heap.page_allocator;
+    const Testcase = struct {
+        path: []const u8,
+        md5: []const u8,
+    };
+    const testcases = [_]Testcase{
+         Testcase{ .path = "tests/dice.qoi",          .md5 = "e1fd5899a63d9afd3421a20689a6e45f" },
+         Testcase{ .path = "tests/edgecase.qoi",      .md5 = "c6db06f18cd79b477f7a6b24da9bc71c" },
+         Testcase{ .path = "tests/kodim10.qoi",       .md5 = "3faf196e3581a7cde5cda8ce256cb9df" },
+         Testcase{ .path = "tests/kodim23.qoi",       .md5 = "f9b3eb87b30413a6cd59ff3b8579000a" },
+         Testcase{ .path = "tests/qoi_logo.qoi",      .md5 = "4520d0de7d5422a2e5a0d50f343e5766" },
+         Testcase{ .path = "tests/testcard.qoi",      .md5 = "87e9f502ec41334ff320fcfd61d63924" },
+         Testcase{ .path = "tests/testcard_rgba.qoi", .md5 = "9d03f697098290d4c19e7551bfc76224" },
+         Testcase{ .path = "tests/wikipedia_008.qoi", .md5 = "d87260df78c17b21d29f9916de0cca2d" },
+    };
+    for (testcases) |testcase| {
+        const file = try dir.openFile(testcase.path,
+                                      std.fs.File.OpenFlags{ .mode = .read_only });
+        defer file.close();
+        var reader = file.reader().any();
+        const data = try readQOI(&reader, allocator);
+        defer allocator.free(data);
+        var hash: [16]u8 = undefined;
+        std.crypto.hash.Md5.hash(std.mem.sliceAsBytes(data), &hash, std.crypto.hash.Md5.Options{ });
+        var hash_expected: [16]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&hash_expected, testcase.md5);
+        testing.expect(std.meta.eql(hash, hash_expected)) catch |err| {
+            std.debug.print("Testcase {s} failed.\n", .{ testcase.path });
+            return err;
+        };
+    }
+}
